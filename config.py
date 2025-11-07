@@ -1,0 +1,6 @@
+BERT_MODEL = "bert-base-uncased"
+DEVICE = "cpu"
+TEXT_EMBED_DIM = 256
+IMG_EMBED_DIM = 4096
+FUSION_DIM = 256
+NUM_CLASSES = 2
