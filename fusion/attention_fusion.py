@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class AttentionFusion(nn.Module):
-    def __init__(self, text_dim, img_dim, fusion_dim):
+    def __init__(self, text_dim, img_dim, fusion_dim, alpha_range=(0.5, 0.9)):
         super().__init__()
         self.text_proj = nn.Linear(text_dim, fusion_dim)
         self.img_proj = nn.Linear(img_dim, fusion_dim)
@@ -22,23 +22,20 @@ class AttentionFusion(nn.Module):
             nn.LayerNorm(fusion_dim)
         )
 
+        self.alpha_min, self.alpha_max = alpha_range
+
     def forward(self, text_feat, img_feat, return_alpha=False):
         text_proj = self.text_proj(text_feat)
         img_proj = self.img_proj(img_feat)
 
-        text_proj = F.normalize(text_proj, p=2, dim=-1)
-        img_proj = F.normalize(img_proj, p=2, dim=-1)
-
         concat = torch.cat([text_proj, img_proj], dim=1)
         alpha = self.attn_layer(concat)
 
-        alpha = 0.2 + 0.6 * alpha
+        alpha = self.alpha_min + (self.alpha_max - self.alpha_min) * alpha
 
         fused = alpha * text_proj + (1 - alpha) * img_proj
 
+        fused = F.normalize(fused, p=2, dim=-1)
         fused_out = self.fusion_mlp(fused)
 
-        if return_alpha:
-            return fused_out, alpha
-        else:
-            return fused_out
+        return (fused_out, alpha) if return_alpha else fused_out

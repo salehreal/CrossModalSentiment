@@ -19,9 +19,10 @@ def load_dataset(csv_path, image_dir):
     texts, images, labels = [], [], []
 
     for _, row in df.iterrows():
-        text = row["text"]
+        text = str(row["text"])
         label = int(row["label"])
-        image_path = os.path.join(image_dir, row["image"])
+        image_name = str(row["image"])
+        image_path = os.path.join(image_dir, image_name)
 
         tokens = tokenizer(text, return_tensors="pt", padding=True, truncation=True)
         input_ids = tokens["input_ids"]
@@ -30,7 +31,8 @@ def load_dataset(csv_path, image_dir):
         try:
             image = Image.open(image_path).convert("RGB")
             image_tensor = transform(image)
-        except:
+        except Exception as e:
+            print(f"Failed to load image: {image_path} → {e}")
             image_tensor = torch.zeros((3, 224, 224))
 
         texts.append((input_ids, attention_mask))

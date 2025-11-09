@@ -16,6 +16,9 @@ class SentimentClassifier(nn.Module):
             nn.Linear(128, num_classes)
         )
 
+        self._init_weights()
+
+    def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
