@@ -1,151 +1,128 @@
 import torch
 from transformers import BertTokenizer
-from PIL import Image
-from torchvision import transforms
-import os
 from config import *
 from models.text_extractor import TextFeatureExtractor
 from models.image_extractor import ImageFeatureExtractor
+from models.audio_extractor import AudioFeatureExtractor
 from fusion.attention_fusion import AttentionFusion
 from models.classifier import SentimentClassifier
-from utils.emoji_processor import extract_emojis, emoji_sentiment_score
-import torch.nn.functional as F
+from utils.emoji_extractor import EmojiFeatureExtractor
+from utils.dataset_loader import MOSEICSDDataset
+from utils.tensor_utils import safe_normalize
+import random
+
+def ensure_clean_text(x):
+
+    import numpy as np
+    def to_str_token(tok):
+        if isinstance(tok, bytes):
+            try:
+                return tok.decode("utf-8", errors="ignore")
+            except Exception:
+                return tok.decode("latin1", errors="ignore")
+        return str(tok)
+
+    if isinstance(x, (list, tuple, np.ndarray)):
+        flat = []
+        for t in x:
+            if isinstance(t, (list, tuple, np.ndarray)):
+                for s in t:
+                    flat.append(to_str_token(s))
+            else:
+                flat.append(to_str_token(t))
+        s = " ".join([w for w in (w.strip() for w in flat) if w and w.lower() != "sp"])
+        return s if s.strip() else "neutral"
+    s = to_str_token(x).strip()
+    return s if s else "neutral"
 
 device = torch.device(DEVICE)
-tokenizer = BertTokenizer.from_pretrained(BERT_MODEL)
+tokenizer = BertTokenizer.from_pretrained(BERT_MODEL, local_files_only=False)
 
-checkpoint = torch.load("model.pth", map_location=device)
+print("Cross-Modal Sentiment Analysis - Testing")
+print("=" * 50)
 
-text_model = TextFeatureExtractor().to(device)
-text_model.load_state_dict(checkpoint["text_model"])
-text_model.eval()
+checkpoint_path = "model.pth"
+try:
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    print(f"Loaded checkpoint from {checkpoint_path}")
+except Exception as e:
+    print(f"Could not load checkpoint '{checkpoint_path}': {e}")
+    checkpoint = None
 
-img_model = ImageFeatureExtractor(output_dim=IMG_EMBED_DIM).to(device)
-img_model.load_state_dict(checkpoint["img_model"])
-img_model.eval()
-
-fusion_model = AttentionFusion(TEXT_EMBED_DIM, IMG_EMBED_DIM, FUSION_DIM, alpha_range=(0.7, 1.0)).to(device)
-fusion_model.load_state_dict(checkpoint["fusion_model"])
-fusion_model.eval()
-
+text_model = TextFeatureExtractor(bert_model=BERT_MODEL, output_dim=TEXT_EMBED_DIM).to(device)
+img_model = ImageFeatureExtractor(input_dim=35, output_dim=IMG_EMBED_DIM, proj_dim=256).to(device)
+audio_model = AudioFeatureExtractor(input_dim=74, output_dim=AUDIO_EMBED_DIM, proj_dim=128).to(device)
+emoji_extractor = EmojiFeatureExtractor(embed_dim=64, proj_dim=TEXT_EMBED_DIM).to(device)
+fusion_model = AttentionFusion(
+    text_dim=TEXT_EMBED_DIM,
+    img_dim=IMG_EMBED_DIM,
+    emoji_dim=TEXT_EMBED_DIM,
+    audio_dim=AUDIO_EMBED_DIM,
+    fusion_dim=FUSION_DIM,
+    text_bias=0.10,
+    emoji_bias=0.05,
+    audio_bias=0.10
+).to(device)
 classifier = SentimentClassifier(FUSION_DIM, NUM_CLASSES).to(device)
-classifier.load_state_dict(checkpoint["classifier"])
-classifier.eval()
 
-transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                         std=[0.229, 0.224, 0.225])
-])
-
-image_choice = input("Choose an image to comment on (img1, img2, img3, img4, img5): ").strip()
-sample_text = input("Enter your comment: ")
-emotion_image_choice = input("Choose an emotional image (happy, happy2, ..., sad5) or leave blank: ").strip()
-
-main_image_path = f"images/{image_choice}.jpg"
-emotional_image_path = f"data/images/{emotion_image_choice}.jpg" if emotion_image_choice else None
-
-tokens = tokenizer(sample_text, return_tensors="pt", padding=True, truncation=True)
-input_ids = tokens["input_ids"].to(device)
-attention_mask = tokens["attention_mask"].to(device)
-with torch.no_grad():
-    text_feat = text_model(input_ids, attention_mask)
-    text_feat = F.normalize(text_feat, p=2, dim=-1)
-
-main_feat, emo_feat = None, None
-
-if os.path.exists(main_image_path):
-    image = Image.open(main_image_path).convert("RGB")
-    image_tensor = transform(image).unsqueeze(0).to(device)
-    with torch.no_grad():
-        main_feat = img_model(image_tensor)
-        main_feat = F.normalize(main_feat, p=2, dim=-1)
-    # print(f"Main image feature norm: {main_feat.norm().item():.2f}")
-
-if emotional_image_path and os.path.exists(emotional_image_path):
-    emo_image = Image.open(emotional_image_path).convert("RGB")
-    emo_tensor = transform(emo_image).unsqueeze(0).to(device)
-    with torch.no_grad():
-        emo_feat = img_model(emo_tensor)
-        emo_feat = F.normalize(emo_feat, p=2, dim=-1)
-    # print(f"Emotional image feature norm: {emo_feat.norm().item():.2f}")
-
-if main_feat is not None and emo_feat is not None:
-    img_feat = 0.5 * main_feat + 0.5 * emo_feat
-elif main_feat is not None:
-    img_feat = main_feat
-elif emo_feat is not None:
-    img_feat = emo_feat
-else:
-    img_feat = None
-
-with torch.no_grad():
-    if img_feat is not None:
-        fused_feat, alpha = fusion_model(text_feat, img_feat, return_alpha=True)
-        output = classifier(fused_feat)
-    else:
-        try:
-            fused_text = fusion_model.text_proj(text_feat)
-            fused_feat = fused_text
-        except Exception:
-            fused_feat = text_feat
-        output = classifier(fused_feat)
-        alpha = torch.tensor([[1.0]])
-
-probs = torch.softmax(output, dim=1)
-pred_label = torch.argmax(probs, dim=1).item()
-label_map = {0: "Negative", 1: "Positive"}
-sentiment = label_map[pred_label]
-
-emojis = extract_emojis(sample_text)
-emoji_score = emoji_sentiment_score(emojis)
-
-print(f"\nPredicted Sentiment: {sentiment}")
-print(f"Emoji Sentiment Score: {emoji_score:.2f}")
-print(f"Attention Weight (text): {alpha.item():.2f}")
-
-print("\nComparative Test of Inputs:")
-
-with torch.no_grad():
+if checkpoint is not None:
     try:
-        text_only_feat = fusion_model.text_proj(text_feat) if hasattr(fusion_model, "text_proj") else text_feat
-        text_only_out = classifier(text_only_feat)
-        text_only_pred = torch.argmax(torch.softmax(text_only_out, dim=1), dim=1).item()
-        # print(f"Text Only → {label_map[text_only_pred]}")
-    except Exception:
-        pass
-        # print("Text Only → (couldn't compute)")
+        if "text_model" in checkpoint: text_model.load_state_dict(checkpoint["text_model"])
+        if "img_model" in checkpoint: img_model.load_state_dict(checkpoint["img_model"])
+        if "audio_model" in checkpoint: audio_model.load_state_dict(checkpoint["audio_model"])
+        if "emoji_extractor" in checkpoint: emoji_extractor.load_state_dict(checkpoint["emoji_extractor"])
+        if "fusion_model" in checkpoint: fusion_model.load_state_dict(checkpoint["fusion_model"])
+        if "classifier" in checkpoint: classifier.load_state_dict(checkpoint["classifier"])
+        print("Models loaded successfully from checkpoint.")
+    except Exception as e:
+        print(f"Warning while loading model weights: {e}")
 
-    if img_feat is not None:
-        try:
-            img_only_feat = fusion_model.img_proj(img_feat) if hasattr(fusion_model, "img_proj") else img_feat
-            img_only_out = classifier(img_only_feat)
-            img_only_pred = torch.argmax(torch.softmax(img_only_out, dim=1), dim=1).item()
-            # print(f"Image Only → {label_map[img_only_pred]}")
-        except Exception:
-            pass
-            # print("Image Only → (couldn't compute)")
-    else:
-        pass
-        # print("Image Only → (no image)")
+text_model.eval(); img_model.eval(); audio_model.eval()
+emoji_extractor.eval(); fusion_model.eval(); classifier.eval()
 
-    if main_feat is not None:
-        fused_main, alpha_main = fusion_model(text_feat, main_feat, return_alpha=True)
-        main_out = classifier(fused_main)
-        main_pred = torch.argmax(torch.softmax(main_out, dim=1), dim=1).item()
-        # print(f"Text + Main Image → {label_map[main_pred]}")
-        # print(f"Attention (text) for Main Image: {alpha_main.item():.2f}")
-    else:
-        pass
-        # print("Main image not found.")
+test_ds = MOSEICSDDataset(sdk_path="data/CMU-MOSEI", split="test", tokenizer=tokenizer, max_len=64)
+label_map = {0: "Negative", 1: "Positive"}
 
-    if main_feat is not None and emo_feat is not None:
-        combined_feat = 0.5 * main_feat + 0.5 * emo_feat
-        fused_full, alpha_full = fusion_model(text_feat, combined_feat, return_alpha=True)
-        full_out = classifier(fused_full)
-        full_pred = torch.argmax(torch.softmax(full_out, dim=1), dim=1).item()
-        print(f"Text + Main + Emotional Image → {label_map[full_pred]}")
-        # print(f"Attention (text) for Full Fusion: {alpha_full.item():.2f}")
-    else:
-        print("Emotional image not provided or missing.")
+indices = random.sample(range(len(test_ds)), 5)
+print(f"\n=== Testing on {indices} samples ===\n")
+
+for i in indices:
+    input_ids, attention_mask, vision, audio, true_label, raw_text = test_ds[i]
+
+    raw_text = ensure_clean_text(raw_text)
+
+    input_ids = input_ids.unsqueeze(0).to(device)
+    attention_mask = attention_mask.unsqueeze(0).to(device)
+    vision = vision.unsqueeze(0).to(device)
+    audio = audio.unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        text_feat = text_model(input_ids, attention_mask)
+        img_feat = img_model(vision)
+        audio_feat = audio_model(audio)
+        emoji_feat = emoji_extractor([raw_text if raw_text.strip() else "neutral"])
+
+        text_feat = safe_normalize(torch.nan_to_num(text_feat))
+        img_feat = safe_normalize(torch.nan_to_num(img_feat))
+        audio_feat = safe_normalize(torch.nan_to_num(audio_feat))
+        emoji_feat = safe_normalize(torch.nan_to_num(emoji_feat))
+
+        fused, alpha = fusion_model(text_feat, img_feat, emoji_feat, audio_feat, return_alpha=True)
+        output = classifier(fused)
+        probs = torch.softmax(output, dim=1)
+        pred_label = torch.argmax(probs, dim=1).item()
+        conf = probs[0, pred_label].item()
+
+    print(f"----- Sample {i+1} -----")
+    print(f"Text: {raw_text}")
+    print(f"True Label: {label_map[true_label]}")
+    print(f"Predicted: {label_map[pred_label]}")
+    print(f"Confidence: {conf:.3f}")
+    print("Attention Weights:")
+    print(f"  Text:   {alpha[0,0].item():.3f}")
+    print(f"  Image:  {alpha[0,1].item():.3f}")
+    print(f"  Emoji:  {alpha[0,2].item():.3f}")
+    print(f"  Audio:  {alpha[0,3].item():.3f}")
+    print()
+
+print("=== Testing completed! ===")

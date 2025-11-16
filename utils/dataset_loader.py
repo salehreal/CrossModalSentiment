@@ -1,42 +1,105 @@
-import pandas as pd
-from transformers import BertTokenizer
-from torchvision import transforms
-from PIL import Image
 import torch
-import os
+from torch.utils.data import Dataset
+import numpy as np
+from mmsdk import mmdatasdk
 
-tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
+def _to_str_token(x):
+    if isinstance(x, bytes):
+        try:
+            return x.decode("utf-8", errors="ignore")
+        except Exception:
+            return x.decode("latin1", errors="ignore")
+    return str(x)
 
-transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                         std=[0.229, 0.224, 0.225])
-])
+class MOSEICSDDataset(Dataset):
+    def __init__(self, sdk_path, split="train", tokenizer=None, max_len=64):
+        self.tokenizer = tokenizer
+        self.max_len = max_len
 
-def load_dataset(csv_path, image_dir):
-    df = pd.read_csv(csv_path)
-    texts, images, labels = [], [], []
+        self.sdk = mmdatasdk.mmdataset({
+            "text": f"{sdk_path}/languages/CMU_MOSEI_TimestampedWords.csd",
+            "vision": f"{sdk_path}/visuals/CMU_MOSEI_VisualFacet42.csd",
+            "audio": f"{sdk_path}/acoustics/CMU_MOSEI_COVAREP.csd",
+            "label": f"{sdk_path}/labels/CMU_MOSEI_Labels.csd",
+        })
 
-    for _, row in df.iterrows():
-        text = str(row["text"])
-        label = int(row["label"])
-        image_name = str(row["image"])
-        image_path = os.path.join(image_dir, image_name)
+        all_ids = list(self.sdk["label"].data.keys())
+        filtered = [vid for vid in all_ids
+                    if vid in self.sdk["text"].data
+                    and vid in self.sdk["vision"].data
+                    and vid in self.sdk["audio"].data]
 
-        tokens = tokenizer(text, return_tensors="pt", padding=True, truncation=True)
-        input_ids = tokens["input_ids"]
-        attention_mask = tokens["attention_mask"]
+        n = len(filtered)
+        if split == "train":
+            self.ids = filtered[: int(0.8 * n)]
+        elif split == "val":
+            self.ids = filtered[int(0.8 * n): int(0.9 * n)]
+        elif split == "test":
+            self.ids = filtered[int(0.9 * n):]
+        else:
+            raise ValueError("Invalid split")
+        print(f"[INFO] Loaded {len(self.ids)} samples for {split}")
+
+    def __len__(self):
+        return len(self.ids)
+
+    def safe_mean(self, arr, fallback_dim):
+        if arr is None:
+            return np.zeros(fallback_dim, dtype=np.float32)
+        arr = np.array(arr, dtype=np.float32)
+        if arr.size == 0:
+            return np.zeros(fallback_dim, dtype=np.float32)
+        arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+        return np.mean(arr, axis=0).astype(np.float32)
+
+    def extract_text(self, vid):
+        words = self.sdk["text"].data[vid]["features"]
+        tokens = []
+        for w in words:
+            token = w[0] if isinstance(w, (list, tuple, np.ndarray)) else w
+            token = _to_str_token(token).strip()
+            if token and token.lower() != "sp":
+                tokens.append(token)
+        text = " ".join(tokens).strip()
+        return text if text else "neutral"
+
+    def __getitem__(self, idx):
+        vid = self.ids[idx]
+        raw_text = self.extract_text(vid)
+        raw_text = _to_str_token(raw_text).strip()
 
         try:
-            image = Image.open(image_path).convert("RGB")
-            image_tensor = transform(image)
-        except Exception as e:
-            print(f"Failed to load image: {image_path} → {e}")
-            image_tensor = torch.zeros((3, 224, 224))
+            label_val = float(self.sdk["label"].data[vid]["features"][0][0])
+            label = 1 if label_val > 0 else 0
+        except Exception:
+            label = 0
 
-        texts.append((input_ids, attention_mask))
-        images.append(image_tensor)
-        labels.append(label)
+        try:
+            vision = self.sdk["vision"].data[vid]["features"]
+            vision_avg = self.safe_mean(vision, 35)
+        except Exception:
+            vision_avg = np.zeros(35, dtype=np.float32)
+        vision_tensor = torch.tensor(vision_avg, dtype=torch.float32)
 
-    return texts, images, labels
+        try:
+            audio = self.sdk["audio"].data[vid]["features"]
+            audio_avg = self.safe_mean(audio, 74)
+        except Exception:
+            audio_avg = np.zeros(74, dtype=np.float32)
+        audio_tensor = torch.tensor(audio_avg, dtype=torch.float32)
+
+        if self.tokenizer:
+            enc = self.tokenizer(
+                raw_text,
+                padding="max_length",
+                truncation=True,
+                max_length=self.max_len,
+                return_tensors="pt",
+            )
+            input_ids = enc["input_ids"].squeeze(0)
+            attention_mask = enc["attention_mask"].squeeze(0)
+        else:
+            input_ids = torch.zeros(self.max_len, dtype=torch.long)
+            attention_mask = torch.zeros(self.max_len, dtype=torch.long)
+
+        return input_ids, attention_mask, vision_tensor, audio_tensor, label, raw_text

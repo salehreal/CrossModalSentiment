@@ -2,8 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class ImageFeatureExtractor(nn.Module):
-    def __init__(self, input_dim=35, output_dim=256, proj_dim=256):
+class AudioFeatureExtractor(nn.Module):
+    def __init__(self, input_dim=74, output_dim=256, proj_dim=128):
         super().__init__()
         self.fc = nn.Sequential(
             nn.Linear(input_dim, 128),

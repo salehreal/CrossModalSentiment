@@ -26,5 +26,5 @@ class SentimentClassifier(nn.Module):
                     nn.init.zeros_(m.bias)
 
     def forward(self, x):
-        x = F.normalize(x, p=2, dim=-1)
+        x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
         return self.fc(x)

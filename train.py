@@ -1,170 +1,238 @@
+import os
+import sys
+import random
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.utils.data import DataLoader, WeightedRandomSampler
+from transformers import BertTokenizer
+
 from config import *
 from models.text_extractor import TextFeatureExtractor
 from models.image_extractor import ImageFeatureExtractor
+from models.audio_extractor import AudioFeatureExtractor
 from fusion.attention_fusion import AttentionFusion
 from models.classifier import SentimentClassifier
-from utils.dataset_loader import load_dataset
+from utils.emoji_extractor import EmojiFeatureExtractor
+from utils.dataset_loader import MOSEICSDDataset
+from utils.tensor_utils import safe_normalize
+from collate_fn import multimodal_collate
 from utils.metrics import evaluate
-from sklearn.model_selection import train_test_split
-from collections import Counter
-from torch.utils.data import Dataset, DataLoader
-import torch.nn.functional as F
-import numpy as np
+from optimization.feature_selector import FeatureSelectorGA
+
+SEED = 42
+torch.manual_seed(SEED)
+np.random.seed(SEED)
+random.seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
 
 device = torch.device(DEVICE)
+tokenizer = BertTokenizer.from_pretrained(BERT_MODEL, local_files_only=False)
 
-from torch.nn.utils.rnn import pad_sequence
+def ensure_clean_text(x):
+    s = x if isinstance(x, str) else str(x)
+    s = s.strip()
+    return s if s else "neutral"
 
-def collate_fn(batch):
-    input_ids = [item[0] for item in batch]
-    attention_masks = [item[1] for item in batch]
-    images = [item[2] for item in batch]
-    labels = [item[3] for item in batch]
+def compute_class_weights_from_dataset(ds, num_classes):
+    from collections import Counter
+    counter = Counter()
+    for _, _, _, _, lbl, _ in ds:
+        counter[lbl] += 1
 
-    input_ids_padded = pad_sequence(input_ids, batch_first=True, padding_value=0)
-    attention_masks_padded = pad_sequence(attention_masks, batch_first=True, padding_value=0)
+    counts = [counter.get(i, 0) for i in range(num_classes)]
+    counts = [c if c > 0 else 1 for c in counts]
+    inv_freq = [1.0 / c for c in counts]
+    norm = sum(inv_freq)
+    weights = [w * num_classes / norm for w in inv_freq]
+    return counts, torch.tensor(weights, dtype=torch.float32)
 
-    images = torch.stack(images)
+def build_weighted_sampler(ds, num_classes):
+    counts, class_weights = compute_class_weights_from_dataset(ds, num_classes)
+    sample_weights = []
+    for _, _, _, _, lbl, _ in ds:
+        sample_weights.append(class_weights[lbl].item())
+    sampler = WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=len(sample_weights),
+        replacement=True
+    )
+    return counts, class_weights, sampler
 
-    labels = torch.tensor(labels, dtype=torch.long)
+print("=== Loading Datasets ===")
+train_dataset = MOSEICSDDataset(sdk_path="data/CMU-MOSEI", split="train", tokenizer=tokenizer, max_len=64)
+val_dataset   = MOSEICSDDataset(sdk_path="data/CMU-MOSEI", split="val",   tokenizer=tokenizer, max_len=64)
 
-    return input_ids_padded, attention_masks_padded, images, labels
+train_counts, class_weights_tensor, train_sampler = build_weighted_sampler(train_dataset, NUM_CLASSES)
+val_counts, _ = compute_class_weights_from_dataset(val_dataset, NUM_CLASSES)
 
-class CommentsDataset(Dataset):
-    def __init__(self, texts, images, labels):
-        self.texts = texts
-        self.images = images
-        self.labels = labels
+print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
+print(f"Train class counts: {train_counts}")
+print(f"Val class counts:   {val_counts}")
+print(f"Class weights (criterion): {class_weights_tensor.tolist()}")
 
-    def __len__(self):
-        return len(self.labels)
-
-    def __getitem__(self, idx):
-        input_ids, attention_mask = self.texts[idx]
-        input_ids = input_ids.squeeze(0)
-        attention_mask = attention_mask.squeeze(0)
-        image = self.images[idx]
-        label = int(self.labels[idx])
-        return input_ids, attention_mask, image, label
-
-text_model = TextFeatureExtractor().to(device)
-img_model = ImageFeatureExtractor(output_dim=IMG_EMBED_DIM).to(device)
-fusion_model = AttentionFusion(TEXT_EMBED_DIM, IMG_EMBED_DIM, FUSION_DIM).to(device)
-classifier = SentimentClassifier(FUSION_DIM, NUM_CLASSES).to(device)
-
-text_model.train()
-img_model.train()
-fusion_model.train()
-classifier.train()
-
-texts, images, labels = load_dataset("user_comments.csv", "images/")
-train_texts, val_texts, train_images, val_images, train_labels, val_labels = train_test_split(
-    texts, images, labels, test_size=0.2, random_state=42, stratify=labels
+train_loader = DataLoader(
+    train_dataset,
+    batch_size=16,
+    sampler=train_sampler,
+    collate_fn=multimodal_collate,
+    num_workers=0
+)
+val_loader = DataLoader(
+    val_dataset,
+    batch_size=16,
+    shuffle=False,
+    collate_fn=multimodal_collate,
+    num_workers=0
 )
 
-train_ds = CommentsDataset(train_texts, train_images, train_labels)
-val_ds = CommentsDataset(val_texts, val_images, val_labels)
+print("=== Initializing Models ===")
+text_model   = TextFeatureExtractor(bert_model=BERT_MODEL, output_dim=TEXT_EMBED_DIM).to(device)
+img_model    = ImageFeatureExtractor(input_dim=35, output_dim=IMG_EMBED_DIM, proj_dim=256).to(device)
+audio_model  = AudioFeatureExtractor(input_dim=74, output_dim=AUDIO_EMBED_DIM, proj_dim=128).to(device)
+emoji_extractor = EmojiFeatureExtractor(embed_dim=64, proj_dim=TEXT_EMBED_DIM).to(device)
+fusion_model = AttentionFusion(
+    text_dim=TEXT_EMBED_DIM,
+    img_dim=IMG_EMBED_DIM,
+    emoji_dim=TEXT_EMBED_DIM,
+    audio_dim=AUDIO_EMBED_DIM,
+    fusion_dim=FUSION_DIM,
+    text_bias=0.10,
+    emoji_bias=0.05,
+    audio_bias=0.10
+).to(device)
+classifier   = SentimentClassifier(FUSION_DIM, NUM_CLASSES).to(device)
 
-BATCH_SIZE = 16
-train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
-val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
+feature_selector = FeatureSelectorGA(input_dim=FUSION_DIM, device=device)
 
-counter = Counter(train_labels)
-weights = [counter[i] for i in sorted(counter)]
-class_weights = torch.tensor([1.0 / w for w in weights], dtype=torch.float32).to(device)
-criterion = nn.CrossEntropyLoss(weight=class_weights)
+criterion = nn.CrossEntropyLoss(weight=class_weights_tensor.to(device))
 
 optimizer = optim.Adam(
     list(text_model.parameters()) +
     list(img_model.parameters()) +
+    list(audio_model.parameters()) +
+    list(emoji_extractor.parameters()) +
     list(fusion_model.parameters()) +
     list(classifier.parameters()),
-    lr=1e-5
+    lr=2e-5
 )
 
-EPOCHS = 5
-for epoch in range(EPOCHS):
+try:
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=2, verbose=True)
+except TypeError:
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=2)
+
+def run_epoch(loader, train_mode=True):
+    if train_mode:
+        text_model.train(); img_model.train(); audio_model.train()
+        emoji_extractor.train(); fusion_model.train(); classifier.train()
+    else:
+        text_model.eval(); img_model.eval(); audio_model.eval()
+        emoji_extractor.eval(); fusion_model.eval(); classifier.eval()
+
     total_loss = 0.0
     y_true, y_pred = [], []
-    text_model.train()
-    img_model.train()
-    fusion_model.train()
-    classifier.train()
 
-    for batch in train_loader:
-        input_ids, attention_mask, imgs, labels_batch = batch
+    for batch_idx, batch in enumerate(loader):
+        input_ids, attention_mask, imgs, audios, labels_batch, raw_texts = batch
+
+        raw_texts = [ensure_clean_text(t) for t in raw_texts]
 
         input_ids = input_ids.to(device)
         attention_mask = attention_mask.to(device)
         imgs = imgs.to(device)
-        labels_batch = labels_batch.to(device, dtype=torch.long)
+        audios = audios.to(device)
+        labels_batch = labels_batch.to(device)
 
-        text_feat = text_model(input_ids, attention_mask)
-        img_feat = img_model(imgs)
+        with torch.set_grad_enabled(train_mode):
+            text_feat  = text_model(input_ids, attention_mask)
+            img_feat   = img_model(imgs)
+            audio_feat = audio_model(audios)
+            emoji_feat = emoji_extractor(raw_texts).to(device)
 
-        text_feat = F.normalize(text_feat, p=2, dim=-1)
-        img_feat = F.normalize(img_feat, p=2, dim=-1)
+            text_feat  = torch.nan_to_num(text_feat,  nan=0.0, posinf=0.0, neginf=0.0)
+            img_feat   = torch.nan_to_num(img_feat,   nan=0.0, posinf=0.0, neginf=0.0)
+            audio_feat = torch.nan_to_num(audio_feat, nan=0.0, posinf=0.0, neginf=0.0)
+            emoji_feat = torch.nan_to_num(emoji_feat, nan=0.0, posinf=0.0, neginf=0.0)
 
-        if np.random.rand() < 0.03:
-            print(f"[DEBUG] text norm mean: {text_feat.norm(dim=-1).mean().item():.4f}, img norm mean: {img_feat.norm(dim=-1).mean().item():.4f}")
+            text_feat  = safe_normalize(text_feat)
+            img_feat   = safe_normalize(img_feat)
+            audio_feat = safe_normalize(audio_feat)
+            emoji_feat = safe_normalize(emoji_feat)
 
-        fused = fusion_model(text_feat, img_feat)
-        output = classifier(fused)
+            fused = fusion_model(text_feat, img_feat, emoji_feat, audio_feat)
+            fused = torch.nan_to_num(fused, nan=0.0, posinf=0.0, neginf=0.0)
 
-        loss = criterion(output, labels_batch)
+            fused = feature_selector.apply(fused)
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+            logits = classifier(fused)
+            loss = criterion(logits, labels_batch)
+
+            if train_mode:
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    list(text_model.parameters()) +
+                    list(img_model.parameters()) +
+                    list(audio_model.parameters()) +
+                    list(emoji_extractor.parameters()) +
+                    list(fusion_model.parameters()) +
+                    list(classifier.parameters()),
+                    max_norm=1.0
+                )
+                optimizer.step()
 
         total_loss += loss.item() * labels_batch.size(0)
-        preds = torch.argmax(output, dim=1).detach().cpu().tolist()
+        preds = torch.argmax(logits, dim=1).detach().cpu().tolist()
         y_pred.extend(preds)
         y_true.extend(labels_batch.detach().cpu().tolist())
 
-    train_metrics = evaluate(y_true, y_pred)
-    avg_loss = total_loss / len(train_ds)
-    print(f"Epoch {epoch+1} | Train Loss: {avg_loss:.4f} | Accuracy: {train_metrics['accuracy']:.2f} | F1: {train_metrics['f1']:.2f}")
+        if train_mode and batch_idx % 200 == 0 and batch_idx > 0:
+            print(f"[Train] batch {batch_idx} | loss {loss.item():.6f}")
 
-    text_model.eval()
-    img_model.eval()
-    fusion_model.eval()
-    classifier.eval()
+    metrics = evaluate(y_true, y_pred)
+    avg_loss = total_loss / len(loader.dataset)
+    return avg_loss, metrics
 
-    with torch.no_grad():
-        val_true, val_pred = [], []
-        for batch in val_loader:
-            input_ids, attention_mask, imgs, labels_batch = batch
-            input_ids = input_ids.to(device)
-            attention_mask = attention_mask.to(device)
-            imgs = imgs.to(device)
-            labels_batch = labels_batch.to(device, dtype=torch.long)
+EPOCHS = 10
+best_val_f1 = -1.0
 
-            text_feat = text_model(input_ids, attention_mask)
-            img_feat = img_model(imgs)
+print("=== Starting Training ===")
+for epoch in range(EPOCHS):
+    train_loss, train_metrics = run_epoch(train_loader, train_mode=True)
+    val_loss,   val_metrics   = run_epoch(val_loader,   train_mode=False)
 
-            text_feat = F.normalize(text_feat, p=2, dim=-1)
-            img_feat = F.normalize(img_feat, p=2, dim=-1)
+    try:
+        lr_before = optimizer.param_groups[0]["lr"]
+        scheduler.step(val_loss)
+        lr_after = optimizer.param_groups[0]["lr"]
+        if lr_after != lr_before:
+            print(f"[Scheduler] LR reduced: {lr_before:.6e} -> {lr_after:.6e}")
+    except Exception as e:
+        print(f"[Scheduler] step error: {e}", file=sys.stderr)
 
-            fused = fusion_model(text_feat, img_feat)
-            output = classifier(fused)
+    print(
+        f"Epoch {epoch+1} | "
+        f"Train Loss: {train_loss:.4f} | Acc: {train_metrics['accuracy']:.3f} | F1: {train_metrics['f1']:.3f} || "
+        f"Val  Loss: {val_loss:.4f} | Acc: {val_metrics['accuracy']:.3f} | F1: {val_metrics['f1']:.3f}"
+    )
 
-            preds = torch.argmax(output, dim=1).detach().cpu().tolist()
-            val_pred.extend(preds)
-            val_true.extend(labels_batch.detach().cpu().tolist())
+    if val_metrics["f1"] > best_val_f1:
+        best_val_f1 = val_metrics["f1"]
+        torch.save({
+            "epoch": epoch,
+            "text_model": text_model.state_dict(),
+            "img_model": img_model.state_dict(),
+            "audio_model": audio_model.state_dict(),
+            "emoji_extractor": emoji_extractor.state_dict(),
+            "fusion_model": fusion_model.state_dict(),
+            "classifier": classifier.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "val_loss": val_loss,
+            "val_metrics": val_metrics,
+        }, "model.pth")
+        print(f"[INFO] Best model saved with val F1={best_val_f1:.4f}")
 
-        val_metrics = evaluate(val_true, val_pred)
-        print(f"Validation | Accuracy: {val_metrics['accuracy']:.2f} | F1: {val_metrics['f1']:.2f}")
-        print(f"Validation Predictions → Positive: {val_pred.count(1)}, Negative: {val_pred.count(0)}")
-
-torch.save({
-    "text_model": text_model.state_dict(),
-    "img_model": img_model.state_dict(),
-    "fusion_model": fusion_model.state_dict(),
-    "classifier": classifier.state_dict()
-}, "model.pth")
-
-print("All models saved in model.pth")
+print("Training finished.")
