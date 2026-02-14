@@ -7,14 +7,19 @@ EMOJI_PATTERN = re.compile(
 )
 
 class EmojiFeatureExtractor(nn.Module):
-    def __init__(self, vocab=None, embed_dim=64, proj_dim=256):
+    def __init__(self, embed_dim=64, proj_dim=256, vocab=None):
         super().__init__()
-        default_vocab = ["😀","😂","🤣","😊","😍","💕","👍","🔥","✨",
-                         "😢","😭","💔","👎","😡","🤬"]
-        self.vocab = vocab or default_vocab
-        self.emoji2idx = {e:i for i,e in enumerate(self.vocab)}
 
-        self.emb = nn.Embedding(len(self.vocab)+1, embed_dim)
+        default_vocab = [
+            "😀","😂","🤣","😊","😍","💕","👍","🔥","✨",
+            "😢","😭","💔","👎","😡","🤬"
+        ]
+
+        self.vocab = vocab if vocab is not None else default_vocab
+        self.emoji2idx = {e: i for i, e in enumerate(self.vocab)}
+
+        self.emb = nn.Embedding(len(self.vocab) + 1, embed_dim)
+
         self.proj = nn.Sequential(
             nn.Linear(embed_dim, proj_dim),
             nn.ReLU()
@@ -23,13 +28,27 @@ class EmojiFeatureExtractor(nn.Module):
     def forward(self, raw_texts):
         device = next(self.emb.parameters()).device
         batch_indices = []
+
         for t in raw_texts:
+            if not isinstance(t, str):
+                t = str(t)
+
             emojis = EMOJI_PATTERN.findall(t)
+
             if not emojis:
-                batch_indices.append(torch.tensor([len(self.vocab)], dtype=torch.long, device=device))
+                unk_idx = len(self.vocab)
+                batch_indices.append(
+                    torch.tensor([unk_idx], dtype=torch.long, device=device)
+                )
                 continue
-            idxs = [self.emoji2idx.get(e, len(self.vocab)) for e in emojis]
-            batch_indices.append(torch.tensor(idxs, dtype=torch.long, device=device))
+
+            idxs = [
+                self.emoji2idx.get(e, len(self.vocab))
+                for e in emojis
+            ]
+            batch_indices.append(
+                torch.tensor(idxs, dtype=torch.long, device=device)
+            )
 
         embeds = []
         for idxs in batch_indices:
