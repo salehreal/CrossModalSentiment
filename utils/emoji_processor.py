@@ -26,3 +26,4 @@ def process_text(text: str):
         "count": count_emojis(emojis),
         "sentiment_score": emoji_sentiment_score(emojis)
     }
+
